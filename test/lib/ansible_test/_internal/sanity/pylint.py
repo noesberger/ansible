@@ -35,6 +35,9 @@ from ..util_common import (
 
 from ..ansible_util import (
     ansible_environment,
+    get_collection_detail,
+    CollectionDetail,
+    CollectionDetailError,
 )
 
 from ..config import (
@@ -48,10 +51,26 @@ from ..data import (
 
 class PylintTest(SanitySingleVersion):
     """Sanity test using pylint."""
+
+    def __init__(self):
+        super(PylintTest, self).__init__()
+        self.optional_error_codes.update([
+            'ansible-deprecated-date',
+            'too-complex',
+        ])
+
     @property
     def error_code(self):  # type: () -> t.Optional[str]
         """Error code for ansible-test matching the format used by the underlying test program, or None if the program does not use error codes."""
         return 'ansible-test'
+
+    @property
+    def supported_python_versions(self):  # type: () -> t.Optional[t.Tuple[str, ...]]
+        """A tuple of supported Python versions or None if the test does not depend on specific Python versions."""
+        # Python 3.9 is not supported on pylint < 2.5.0.
+        # Unfortunately pylint 2.5.0 and later include an unfixed regression.
+        # See: https://github.com/PyCQA/pylint/issues/3701
+        return tuple(python_version for python_version in super(PylintTest, self).supported_python_versions if python_version not in ('3.9',))
 
     def filter_targets(self, targets):  # type: (t.List[TestTarget]) -> t.List[TestTarget]
         """Return the given list of test targets, filtered to include only those relevant for the test."""
@@ -138,6 +157,17 @@ class PylintTest(SanitySingleVersion):
 
         python = find_python(python_version)
 
+        collection_detail = None
+
+        if data_context().content.collection:
+            try:
+                collection_detail = get_collection_detail(args, python)
+
+                if not collection_detail.version:
+                    display.warning('Skipping pylint collection version checks since no collection version was found.')
+            except CollectionDetailError as ex:
+                display.warning('Skipping pylint collection version checks since collection detail loading failed: %s' % ex.reason)
+
         test_start = datetime.datetime.utcnow()
 
         for context, context_paths in sorted(contexts):
@@ -145,7 +175,7 @@ class PylintTest(SanitySingleVersion):
                 continue
 
             context_start = datetime.datetime.utcnow()
-            messages += self.pylint(args, context, context_paths, plugin_dir, plugin_names, python)
+            messages += self.pylint(args, context, context_paths, plugin_dir, plugin_names, python, collection_detail)
             context_end = datetime.datetime.utcnow()
 
             context_times.append('%s: %d (%s)' % (context, len(context_paths), context_end - context_start))
@@ -184,6 +214,7 @@ class PylintTest(SanitySingleVersion):
             plugin_dir,  # type: str
             plugin_names,  # type: t.List[str]
             python,  # type: str
+            collection_detail,  # type: CollectionDetail
     ):  # type: (...) -> t.List[t.Dict[str, str]]
         """Run pylint using the config specified by the context on the specified paths."""
         rcfile = os.path.join(SANITY_ROOT, 'pylint', 'config', context.split('/')[0] + '.cfg')
@@ -203,7 +234,7 @@ class PylintTest(SanitySingleVersion):
             config = dict()
 
         disable_plugins = set(i.strip() for i in config.get('disable-plugins', '').split(',') if i)
-        load_plugins = set(plugin_names) - disable_plugins
+        load_plugins = set(plugin_names + ['pylint.extensions.mccabe']) - disable_plugins
 
         cmd = [
             python,
@@ -211,10 +242,17 @@ class PylintTest(SanitySingleVersion):
             '--jobs', '0',
             '--reports', 'n',
             '--max-line-length', '160',
+            '--max-complexity', '20',
             '--rcfile', rcfile,
             '--output-format', 'json',
             '--load-plugins', ','.join(load_plugins),
         ] + paths
+
+        if data_context().content.collection:
+            cmd.extend(['--collection-name', data_context().content.collection.full_name])
+
+            if collection_detail and collection_detail.version:
+                cmd.extend(['--collection-version', collection_detail.version])
 
         append_python_path = [plugin_dir]
 
@@ -223,6 +261,9 @@ class PylintTest(SanitySingleVersion):
 
         env = ansible_environment(args)
         env['PYTHONPATH'] += os.path.pathsep + os.path.pathsep.join(append_python_path)
+
+        # expose plugin paths for use in custom plugins
+        env.update(dict(('ANSIBLE_TEST_%s_PATH' % k.upper(), os.path.abspath(v) + os.path.sep) for k, v in data_context().content.plugin_paths.items()))
 
         if paths:
             display.info('Checking %d file(s) in context "%s" with config: %s' % (len(paths), context, rcfile), verbosity=1)

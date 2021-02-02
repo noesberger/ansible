@@ -25,7 +25,6 @@ from ..util import (
     display,
     parse_to_list_of_dict,
     is_subdir,
-    ANSIBLE_LIB_ROOT,
     generate_pip_command,
     find_python,
 )
@@ -33,7 +32,6 @@ from ..util import (
 from ..util_common import (
     intercept_command,
     run_command,
-    write_text_file,
     ResultType,
 )
 
@@ -78,11 +76,13 @@ class ImportTest(SanityMultipleVersion):
         """
         capture_pip = args.verbosity < 2
 
+        python = find_python(python_version)
+
         if python_version.startswith('2.') and args.requirements:
             # hack to make sure that virtualenv is available under Python 2.x
             # on Python 3.x we can use the built-in venv
-            pip = generate_pip_command(find_python(python_version))
-            run_command(args, generate_pip_install(pip, 'sanity.import', packages=['virtualenv']), capture=capture_pip)
+            pip = generate_pip_command(python)
+            run_command(args, generate_pip_install(pip, '', packages=['virtualenv']), capture=capture_pip)
 
         settings = self.load_processor(args, python_version)
 
@@ -104,50 +104,42 @@ class ImportTest(SanityMultipleVersion):
 
         # add the importer to our virtual environment so it can be accessed through the coverage injector
         importer_path = os.path.join(virtual_environment_bin, 'importer.py')
+        yaml_to_json_path = os.path.join(virtual_environment_bin, 'yaml_to_json.py')
         if not args.explain:
             os.symlink(os.path.abspath(os.path.join(SANITY_ROOT, 'import', 'importer.py')), importer_path)
-
-        # create a minimal python library
-        python_path = os.path.join(temp_root, 'lib')
-        ansible_path = os.path.join(python_path, 'ansible')
-        ansible_init = os.path.join(ansible_path, '__init__.py')
-        ansible_link = os.path.join(ansible_path, 'module_utils')
-
-        if not args.explain:
-            remove_tree(ansible_path)
-
-            write_text_file(ansible_init, '', create_directories=True)
-
-            os.symlink(os.path.join(ANSIBLE_LIB_ROOT, 'module_utils'), ansible_link)
-
-            if data_context().content.collection:
-                # inject just enough Ansible code for the collections loader to work on all supported Python versions
-                # the __init__.py files are needed only for Python 2.x
-                # the empty modules directory is required for the collection loader to generate the synthetic packages list
-
-                write_text_file(os.path.join(ansible_path, 'utils/__init__.py'), '', create_directories=True)
-
-                os.symlink(os.path.join(ANSIBLE_LIB_ROOT, 'utils', 'collection_loader.py'), os.path.join(ansible_path, 'utils', 'collection_loader.py'))
-                os.symlink(os.path.join(ANSIBLE_LIB_ROOT, 'utils', 'singleton.py'), os.path.join(ansible_path, 'utils', 'singleton.py'))
-
-                write_text_file(os.path.join(ansible_path, 'modules/__init__.py'), '', create_directories=True)
+            os.symlink(os.path.abspath(os.path.join(SANITY_ROOT, 'import', 'yaml_to_json.py')), yaml_to_json_path)
 
         # activate the virtual environment
         env['PATH'] = '%s:%s' % (virtual_environment_bin, env['PATH'])
-        env['PYTHONPATH'] = python_path
 
         env.update(
-            SANITY_IMPORT_DIR=os.path.relpath(temp_root, data_context().content.root) + os.path.sep,
-            SANITY_MINIMAL_DIR=os.path.relpath(virtual_environment_path, data_context().content.root) + os.path.sep,
+            SANITY_TEMP_PATH=ResultType.TMP.path,
         )
+
+        if data_context().content.collection:
+            env.update(
+                SANITY_COLLECTION_FULL_NAME=data_context().content.collection.full_name,
+                SANITY_EXTERNAL_PYTHON=python,
+            )
 
         virtualenv_python = os.path.join(virtual_environment_bin, 'python')
         virtualenv_pip = generate_pip_command(virtualenv_python)
 
         # make sure coverage is available in the virtual environment if needed
         if args.coverage:
-            run_command(args, generate_pip_install(virtualenv_pip, 'sanity.import', packages=['setuptools']), env=env, capture=capture_pip)
-            run_command(args, generate_pip_install(virtualenv_pip, 'sanity.import', packages=['coverage']), env=env, capture=capture_pip)
+            run_command(args, generate_pip_install(virtualenv_pip, '', packages=['setuptools']), env=env, capture=capture_pip)
+            run_command(args, generate_pip_install(virtualenv_pip, '', packages=['coverage']), env=env, capture=capture_pip)
+
+        try:
+            # In some environments pkg_resources is installed as a separate pip package which needs to be removed.
+            # For example, using Python 3.8 on Ubuntu 18.04 a virtualenv is created with only pip and setuptools.
+            # However, a venv is created with an additional pkg-resources package which is independent of setuptools.
+            # Making sure pkg-resources is removed preserves the import test consistency between venv and virtualenv.
+            # Additionally, in the above example, the pyparsing package vendored with pkg-resources is out-of-date and generates deprecation warnings.
+            # Thus it is important to remove pkg-resources to prevent system installed packages from generating deprecation warnings.
+            run_command(args, virtualenv_pip + ['uninstall', '--disable-pip-version-check', '-y', 'pkg-resources'], env=env, capture=capture_pip)
+        except SubprocessError:
+            pass
 
         run_command(args, virtualenv_pip + ['uninstall', '--disable-pip-version-check', '-y', 'setuptools'], env=env, capture=capture_pip)
         run_command(args, virtualenv_pip + ['uninstall', '--disable-pip-version-check', '-y', 'pip'], env=env, capture=capture_pip)
